@@ -1,0 +1,286 @@
+---
+title: "vl_final"
+output: html_document
+---
+
+# Comparison of peptide-MHC-I Binding Prediction Models
+
+Author: Vishal Lashkari
+
+Purpose: to use descriptive and inferential statistics to compare the predictions made by well-established models (NetMHCpan) against predictions made by models with newer architectures (HLApollo).
+
+# Tile Protein Sequences
+
+From protein sequences in fasta format, create a tiled csv of peptides suitable for predictions on NetMHCpan and HLApollo.
+
+Here, human chromosome 21 is tiled into 9mers. Duplicates are removed. Some duplicate peptides were retained if the flanking regions are distinct as this is an additional input to HLApollo.
+
+No pathogenic peptides are included.
+
+Data from UniProt: <https://www.uniprot.org/proteomes/UP000005640>
+
+```{r}
+library(readr)
+library(dplyr)
+library(Biostrings)
+
+proteome<-readAAStringSet('chr21.fasta')
+
+flank_len <- 10   # length of flanks (10 for HLApollo)
+mer <- 9          # peptide length
+pred_allele <- 'A*02:01' # To notate for HLApollo
+
+# Empty list to store tiles
+results <- list()
+
+# Hash to prevent duplicates
+seen <- new.env(hash = TRUE, parent = emptyenv())
+
+# Create a progress bar
+bar <- txtProgressBar(min = 0, max = length(proteome), style = 3)
+
+# For each protein sequence in the fasta
+for (i in 1:length(proteome)) {
+  seq <- proteome[i]  # get the protein sequence
+  prot_len <- width(seq)
+  
+  # Unlikely to exist but skip proteins with length < peptide length
+  if (prot_len < mer) {
+    setTxtProgressBar(bar, i)
+    next
+  }
+  
+  # Sliding window
+  for (start_pos in 1:(prot_len - mer + 1)) {
+    query <- subseq(seq, start_pos, start_pos + mer - 1) # seq to be predicted
+    
+    # store N terminal flanking residues
+    n_start <- max(1, start_pos - flank_len)
+    n_flank <- subseq(seq, n_start, start_pos - 1)
+    n_flank <- as.character(n_flank)
+    
+    # Pad with '*' for HLApollo
+    if (nchar(n_flank) < flank_len){
+      n_flank <- paste0(strrep('*', flank_len - nchar(n_flank)), n_flank)
+    }
+    
+    # store C terminal flanking residues
+    c_end <- min(prot_len, start_pos + mer + flank_len - 1)
+    c_flank <- subseq(seq, start_pos + mer, c_end)
+    c_flank <- as.character(c_flank)
+    
+    # Pad with '*' for HLApollo
+    if (nchar(c_flank) < flank_len){
+      c_flank <- paste0(c_flank, strrep('*', flank_len - nchar(c_flank)))
+    }
+    
+    # Hash the peptide, n flank, and c flank
+    key <- paste(n_flank, query, c_flank, sep = '|')
+    
+    # Do not store duplicate triplets (may have duplicate sequences)
+    if (exists(key, envir = seen, inherits = FALSE))
+      next
+    
+    assign(key, TRUE, envir = seen)
+    
+    # Store
+    results[[length(results) + 1]] <- list(
+      allele = (pred_allele),
+      peptide = as.character(query),
+      n_flank = as.character(n_flank),
+      c_flank = as.character(c_flank)
+    )
+  }
+  
+  # Update progress bar for each protein
+  setTxtProgressBar(bar, i)
+}
+
+# Close the progress bar
+close(bar)
+
+# Aggregate into df
+proteome_flanks <- bind_rows(results)
+
+# Write csv (in HLApollo input format)
+write_csv(proteome_flanks, "chr21_tiled.csv")
+
+```
+
+# Make Predictions
+
+Predictions on the tiled chromosome were made with:
+
+-   NetMHCpan 4.1 <https://services.healthtech.dtu.dk/services/NetMHCpan-4.1/>
+-   HLApollo <https://github.com/Genentech/HLApollo>
+
+Predictions were made only for HLA-A\*02:01, the most common allele in the United States.
+
+The relevant metric is the percentile rank which both models output. A stronger binder will have a lower value for its percentile rank.
+
+NetMHCpan predictions were made only on the 9mer sequence in question.
+
+HLApollo predictions were made by additionally supplying the 10 aa flanking the 9mer on either side in the native protein sequence.
+
+# Combine Predictions
+
+Percentile ranks for the same 9mer but with different flanking residues were averaged. This produces a list of unique peptides, each with two percentile predictions (one from each model).
+
+```{r}
+library(readr)
+library(tidyverse)
+
+# Load predictions data
+net <- read_csv('chr21_tiled_netmhcpan.csv')
+apollo <- read_csv('chr21_tiled_hlapollo.csv')
+nrow(net)
+nrow(apollo)
+# Remove duplicates from net (predicts on peptide only without flanks)
+net <- net %>%
+  distinct(Peptide, .keep_all = TRUE)
+
+# Average duplicate from apollo (peptides with different flanks)
+apollo <- apollo %>%
+  group_by(peptide) %>%
+  summarise(mhc_pred_0_rank = mean(mhc_pred_0_rank), .groups = 'drop')
+
+nrow(apollo)
+
+# Merge the predictions
+# SELECT net.Peptide AS peptide
+# net.EL_rank AS net,
+# apollo.mhc_pred_0_rank AS apollo
+# FROM net
+# JOIN apollo
+# ON net.Peptide = apollo.peptide
+
+predictions <- net %>%
+  inner_join(apollo, by=c('Peptide'='peptide')) %>%
+  transmute(peptide = Peptide, net = EL_Rank, apollo = mhc_pred_0_rank)
+
+# Should match length of net because net has no duplicate peptides
+# apollo has some duplicate peptides if they have unique flanks
+# After merging, apollo length should also match
+nrow(predictions)
+
+head(predictions)
+```
+
+# Density Plot
+
+Show the distribution of predictions for each model on the same set of peptides.
+
+Also, show the median percentile rank.
+
+```{r}
+library(ggplot2)
+library(tidyr)
+
+# Create density plot
+
+pred_long <- predictions %>%
+  pivot_longer(cols = c(net, apollo), names_to = "model", values_to = "score") %>%
+  mutate(model = recode(model, net = "NetMHCpan", apollo = "HLApollo"))
+
+# Calculate median to annotate
+medians <- pred_long %>%
+  group_by(model) %>%
+  summarise(median = median(score))
+
+den <- ggplot(pred_long, aes(x = score, fill = model)) +
+  geom_density(alpha = 0.4) +
+  geom_vline(data = medians, aes(xintercept = median, color = model),
+             linetype = "dashed", size = 1, show.legend=FALSE) +
+  geom_text(data = medians, aes(x = median, y = 0.07, label = paste0("Median: ", round(median,2))),
+            angle = 90, vjust = -0.5, hjust = 1, color = "black") +
+  labs(title = "Distribution of Predicted Binding", x = "Binder Percentile", 
+       y = "Density", fill = "Model")
+
+colors <- ggplot_build(den)$data[[1]]$fill %>% unique()
+
+print(den)
+```
+
+# Comparison of Strong Binders
+
+Call strong binders as those predicted in the top 1%.
+
+```{r}
+# call strong binders as top 1%
+venn_predictions <- predictions %>%
+  mutate(
+    net_strong = net < 1,
+    apollo_strong = apollo < 1
+  )
+
+net_strong_count <- sum(venn_predictions$net_strong)
+apollo_strong_count <- sum(venn_predictions$apollo_strong)
+overlap_count <- sum(venn_predictions$net_strong & venn_predictions$apollo_strong)
+
+library(ggvenn)
+
+venn_data <- list(
+  NetMHCpan = venn_predictions$peptide[venn_predictions$net_strong],
+  HLApollo  = venn_predictions$peptide[venn_predictions$apollo_strong]
+)
+
+ggvenn(venn_data,
+       fill_color = colors) +  # match histogram colors
+  ggtitle("Predicted Strong Binders")
+
+
+```
+
+# Model Agreement
+
+Investigate model agreement with a Bland-Altman plot since two different models are predicting the same metric on the same peptides.
+
+```{r}
+library(blandr)
+
+# Bland–Altman plot
+diffs <- predictions$net - predictions$apollo
+mean_diff <- mean(diffs); sd_diff <- sd(diffs)
+blandr.draw(predictions$net, predictions$apollo) +
+  labs(title="Model Agreement", x="Mean", y="Difference") +
+  geom_hline(yintercept = mean_diff, linetype="solid") +
+  geom_hline(yintercept = mean_diff + 1.96*sd_diff, linetype="dashed") +
+  geom_hline(yintercept = mean_diff - 1.96*sd_diff, linetype="dashed") +
+  annotate("text", x=11, y=c(mean_diff, mean_diff + 1.96*sd_diff, mean_diff - 1.96*sd_diff),
+           label = paste0(c("Mean: ", "Upper: ", "Lower: "), round(c(mean_diff, mean_diff + 1.96*sd_diff, mean_diff - 1.96*sd_diff),2)),
+           hjust=1, vjust=c(-0.5,-0.5,1.5))
+
+
+```
+
+# Model Correlation
+
+The models may have correlation without agreement.
+
+```{r}
+library(ggplot2)
+
+cor_val <- cor(predictions$net, predictions$apollo)
+
+ggplot(predictions, aes(x = net, y = apollo)) + 
+  geom_point(alpha = 0.2) + 
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  annotate("text", x = 100, y = 100,
+           label = paste0("r = ", round(cor_val, 2)), color = "black") +
+    labs(title = "Comparison of Predicted Binder Percentiles",
+       x = "NetMHCpan Percentile",
+       y = "HLApollo Percentile")
+```
+
+# Hypothesis Testing
+
+Use a paired t-test as well as the Wilcoxon signed-rank test to determine if the two models have statistically significantly different predictions.
+
+```{r}
+# Paired t-test
+print(t.test(predictions$net, predictions$apollo, paired = TRUE))
+
+# Wilcoxon
+print(wilcox.test(predictions$net, predictions$apollo, paired = TRUE))
+
+```
